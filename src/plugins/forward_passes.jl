@@ -370,3 +370,84 @@ function forward_pass(
     end
     return pass
 end
+
+
+mutable struct QTRForwardPass{T<:AbstractForwardPass} <:
+        AbstractForwardPass
+    forward_pass::T
+    trial_centre::Dict{Symbol,Float64}
+    multiplier::Vector{Float64}
+    ψ::Float64
+    dual_thres::Float64
+
+    function QTRForwardPass(;
+        psi::Float64 = 0.05,
+        dual_thres::Float64 = 100.0,
+        forward_pass::AbstractForwardPass = DefaultForwardPass(),
+    )
+        centre = Dict{Symbol,Float64}()
+        multiplier = Vector{Float64}()
+        return new{typeof(forward_pass)}(forward_pass, centre,multiplier, psi,dual_thres)
+    end
+end
+
+function forward_pass(
+    model::PolicyGraph,
+    options::Options,
+    fp::QTRForwardPass,
+    )
+        if length(model.root_children) != 1
+            error(
+                "RegularizedForwardPass cannot be applied because first-stage is " *
+                "not deterministic",
+            )
+        end
+        
+        node = model[model.root_children[1].term]
+        if length(node.noise_terms) > 1
+            error(
+                 "RegularizedForwardPass cannot be applied because first-stage is " *
+                 "not deterministic",
+            )
+        end
+
+
+    # constraint set
+    con_set = name.(JuMP.all_constraints(node.subproblem,include_variable_in_set_constraints=false))
+
+    # Get current stability centre 
+    x = get(fp.trial_centre, k, model.initial_root_state[k])
+
+    # update dynamic parameter: If trust region is not binding, halve the parameters
+    if "qtr" in con_set
+        dual = JuMP.dual(node.subproblem[:qtr])
+        
+        if dual <= fp.dual_thres
+            mult = 0.5*multplier[end]
+        else
+            mult = multiplier[end]
+        end
+    else
+        mult = fp.ψ
+    end
+
+    push!(fp.multiplier, mult)
+
+    # Build QTR constraint
+    @constraint(node.subproblem, qtr,
+        sum((v.out - x[k])^2 for (k, v) in node.states) <= mult * sum(x[k]^2 for (k, v) in node.states)
+    );
+
+    pass = forward_pass(model, options, fp.forward_pass)
+
+    for (k, v) in node.states
+        fp.trial_centre[k] = pass.sampled_states[1][k]
+    end
+
+    # Delete QTR constraint
+    delete!(node.subproblem, :qtr)
+    unregister(node.subproblem, :qtr)
+
+
+    return pass
+end
